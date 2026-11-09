@@ -1,0 +1,22 @@
+version: 2
+
+updates:
+  # Go 依赖：cobra / pflag / toml / x/term。
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  # 工作流里引用的 action 也要跟着升，否则会漂在已废弃的大版本上。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"

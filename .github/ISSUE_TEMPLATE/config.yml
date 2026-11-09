@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 用法与参数说明
+    url: https://github.com/kiddingbaby/skills/blob/main/skills/image-gen/SKILL.md
+    about: 参数表、退出码、失败信息对照在 skill 文档里；先看这份再来提 issue
+  - name: 安全问题
+    url: https://github.com/kiddingbaby/image-gen/blob/main/SECURITY.md
+    about: 不要用公开 issue 报告漏洞

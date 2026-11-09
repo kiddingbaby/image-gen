@@ -1,0 +1,62 @@
+name: Bug report
+description: 报告 image-gen 的行为问题、崩溃或输出异常
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        贴日志前先删掉网关地址里的 token 与 API 密钥。安全漏洞不要走这里，见 [SECURITY.md](https://github.com/kiddingbaby/image-gen/blob/main/SECURITY.md)。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 期望的结果与实际结果，以及能复现的最小命令。
+      placeholder: |
+        image-gen generate "..." --size 1024x1024
+        期望：落盘一张 PNG；实际：退出码 5，报 ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: image-gen 版本
+      description: "`image-gen --version` 的输出"
+      placeholder: image-gen 0.11.3
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: 安装方式
+      options:
+        - go install
+        - 发布页二进制
+        - 自己编译
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: 系统与架构
+      placeholder: macOS 15 / arm64
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: 网关侧模型能力
+      description: 报错可能来自模型或网关实现，不是 CLI 本身。
+      options:
+        - 换模型后仍复现（CLI 侧问题可能性大）
+        - 只有某个模型复现
+        - 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 报错原文
+      description: 退出码与 stderr。不要把 `IMAGE_GEN_API_KEY` 或网关 token 贴进来。
+      render: text
+    validations:
+      required: false

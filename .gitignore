@@ -1,9 +1,12 @@
 .DS_Store
 *.log
 
-# Go 构建产物
+# Go 构建与测试产物
 /dist/
 /image-gen
 /image-gen.exe
-# 本地 Go 构建缓存（GOCACHE 指向这里，避免写 ~/.cache）
+*.test
+coverage.out
+
+# 编辑器 / 本地工具缓存（GOCACHE 等指向这里，避免写 ~/.cache）
 /.cache/
