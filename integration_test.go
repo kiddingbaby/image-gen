@@ -561,13 +561,10 @@ func TestInitArgsWritesUsableConfig(t *testing.T) {
 		t.Fatalf("--init 失败: %v", err)
 	}
 
-	info, err := os.Stat(cfgPath)
-	if err != nil {
+	if _, err := os.Stat(cfgPath); err != nil {
 		t.Fatalf("配置文件没写出来: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != fileModeSecret {
-		t.Errorf("配置权限 = %o, 期望 %o", perm, fileModeSecret)
-	}
+	assertSecretMode(t, cfgPath)
 
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
@@ -1037,11 +1034,10 @@ func TestInitSubcommandNonInteractive(t *testing.T) {
 	if !strings.Contains(stdout, "已写入") {
 		t.Errorf("init 应确认写入结果:\n%s", stdout)
 	}
-	if info, statErr := os.Stat(cfgPath); statErr != nil {
+	if _, statErr := os.Stat(cfgPath); statErr != nil {
 		t.Errorf("配置文件不可用: %v", statErr)
-	} else if info.Mode().Perm() != 0o600 {
-		t.Errorf("配置文件权限 = %o, 期望 600", info.Mode().Perm())
 	}
+	assertSecretMode(t, cfgPath)
 
 	_, err = runCommand(t, "init", "--config", cfgPath, "extra")
 	if err == nil || exitCodeOf(err) != exitUsage {

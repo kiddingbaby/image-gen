@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -267,13 +268,7 @@ func TestWriteConfigFileGuardAndMode(t *testing.T) {
 	if err := writeConfigFile(path, "https://gw/v1", "m", []string{"[auth]", `env = "K"`}, false); err != nil {
 		t.Fatalf("首次写入失败：%v", err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != fileModeSecret {
-		t.Errorf("配置权限 = %v, want %v", info.Mode().Perm(), fileModeSecret)
-	}
+	assertSecretMode(t, path)
 	if err := writeConfigFile(path, "https://gw2/v1", "", nil, false); err == nil {
 		t.Error("已存在且未加 --force 时应当报错")
 	}
@@ -405,5 +400,24 @@ func TestFilterModels(t *testing.T) {
 	}
 	if n := len(filterModels(ids, "zzz")); n != 0 {
 		t.Errorf("无匹配时应为空，得到 %d 个", n)
+	}
+}
+
+// assertSecretMode 断言配置文件只有所有者可读写。
+//
+// Windows 的文件权限是只读位加 ACL，os.Stat 只能报 0666，POSIX 权限位在这个
+// 平台上不可观测——与其断言一个拿不到的值，不如在 Windows 上跳过这一项；
+// 真实保护由 ACL 与用户目录下的默认继承决定，不是 0600 位。
+func assertSecretMode(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("取 %s 的文件信息失败：%v", path, err)
+	}
+	if perm := info.Mode().Perm(); perm != fileModeSecret {
+		t.Errorf("%s 权限 = %#o, want %#o", path, perm, fileModeSecret)
 	}
 }
