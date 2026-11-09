@@ -1,21 +1,22 @@
-// Command image-gen generates bitmap images through an OpenAI-compatible
+// Command image-gen generates and edits images through an OpenAI-compatible
 // image gateway. It is a single static binary with no runtime dependencies.
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
@@ -31,11 +33,9 @@ import (
 )
 
 const (
-	maxEdge   = 3840
-	maxPixels = 8294400 // 官方上限 3840x2160
-	maxRatio  = 3.0
-	// OpenAI 兼容接口的两条固定路径
+	// OpenAI 兼容接口的固定路径
 	generatePath = "/images/generations"
+	editPath     = "/images/edits"
 	modelsPath   = "/models"
 	// 模型列表的输出控制：超过 inline 上限就只给用法，超过 print 上限就截断。
 	modelsInlineLimit = 50
@@ -82,13 +82,25 @@ type authConfig struct {
 }
 
 type config struct {
-	BaseURL string     `toml:"base_url"`
-	Model   string     `toml:"model"`
-	OutDir  string     `toml:"out_dir"`
-	Auth    authConfig `toml:"auth"`
+	BaseURL  string     `toml:"base_url"`
+	Model    string     `toml:"model"`
+	OutDir   string     `toml:"out_dir"`
+	Auth     authConfig `toml:"auth"`
+	Defaults struct {
+		Size    string `toml:"size"`
+		Quality string `toml:"quality"`
+	} `toml:"defaults"`
 }
 
 type options struct {
+	jsonlOutput                         bool
+	ctx                                 context.Context
+	markupPath, markupURL, markupFileID string
+	sources                             []imageSource
+	maskURL, maskFileID                 string
+	imageParameters
+	supplied             map[string]bool
+	result               *imageResult
 	configPath           string
 	baseURL              string
 	force                bool
@@ -110,7 +122,10 @@ type options struct {
 	quiet                bool
 	noInput              bool
 	prompt               string
+	promptArgument       bool
 	keyword              string
+	imagePaths           []string
+	maskPath             string
 }
 
 type optionalIntValue struct {
@@ -141,6 +156,9 @@ var stderrTTY = stderrIsTerminal
 var statusWriter io.Writer = os.Stderr
 
 type savedImage struct {
+	Index  int    `json:"index"`
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
 	Path   string `json:"path"`
 	Format string `json:"format"`
 	Bytes  int    `json:"bytes"`
@@ -195,7 +213,7 @@ const maxRateLimitRetries = 2
 
 // retryDelay 是第 attempt 次重试前的等待；提成变量是为了让测试不必真等 3 秒。
 var retryDelay = func(attempt int) time.Duration {
-	return time.Duration(attempt+1) * time.Second
+	return time.Duration(attempt+1)*time.Second + time.Duration(mathrand.IntN(250))*time.Millisecond
 }
 
 func main() {
@@ -206,16 +224,22 @@ func main() {
 
 // run 用 Cobra 执行命令树；单独抽出来便于测试。
 func run(args []string) error {
-	root := newRootCmd()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	o := &options{ctx: ctx}
+	root := rootCommand(o)
 	root.SetArgs(args)
-	return root.Execute()
+	cmd, err := root.ExecuteC()
+	if cmd != nil && (cmd.Name() == "generate" || cmd.Name() == "edit") && (err != nil || o.result != nil) {
+		return finishImage(o, cmd.Name(), err)
+	}
+	return err
 }
 
-func newRootCmd() *cobra.Command {
-	o := &options{}
+func rootCommand(o *options) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "image-gen",
-		Short:         "通过 OpenAI 兼容网关生成图片",
+		Short:         "通过 OpenAI 兼容网关生成或编辑图片",
 		Long:          rootLong,
 		Example:       rootExamples,
 		Version:       effectiveVersion(),
@@ -242,6 +266,7 @@ func newRootCmd() *cobra.Command {
 
 	root.AddCommand(
 		newGenerateCmd(o),
+		newEditCmd(o),
 		newModelsCmd(o),
 		newInitCmd(o),
 		newVersionCmd(),
@@ -249,15 +274,16 @@ func newRootCmd() *cobra.Command {
 	return root
 }
 
-const rootLong = `通过任意兼容 OpenAI /v1/images/generations 的网关生成图片。
+const rootLong = `通过兼容 OpenAI images 接口的网关生成或编辑图片。
 
 提示词可从位置参数或 stdin 读取：
   image-gen generate "一只橘猫"
   echo "一只橘猫" | image-gen generate
+  image-gen edit "把背景换成雨夜街道" --image original.png
 
 配置优先级：命令行参数 > 环境变量 > config.toml。
 退出码：0 成功；2 参数/用法错误；3 配置或密钥缺失；
-        4 网络错误；5 上游返回错误；1 其它。`
+        4 网络错误；5 上游返回错误；130 用户取消；1 本地运行错误。`
 
 const rootExamples = `  image-gen generate "一只在纸上洇开的墨点"
   echo "一只橘猫" | image-gen generate --model <模型>
@@ -279,26 +305,35 @@ func newGenerateCmd(o *options) *cobra.Command {
 			}
 			if len(args) == 1 {
 				o.prompt = args[0]
+				o.promptArgument = true
 			}
 			cfg, err := loadConfig(o.configPath)
 			if err != nil {
 				return withExit(exitConfig, err)
 			}
+			captureImageFlags(cmd, o)
 			return cmdGenerate(o, cfg)
 		},
 	}
 	addGenerateFlags(cmd.Flags(), o)
+	cmd.Flags().Lookup("quality").Usage += "；旧模型另支持 standard/hd"
+	cmd.Flags().StringVar(&o.responseFormat, "response-format", "", "旧模型兼容：url/b64_json")
+	cmd.Flags().StringVar(&o.style, "style", "", "旧模型兼容：vivid/natural")
+	completeImageFlags(cmd)
+	return cmd
+}
+
+func completeImageFlags(cmd *cobra.Command) {
 	_ = cmd.MarkFlagDirname("output-dir")
 	for flag, choices := range map[string][]string{
 		"size":       {"auto", "1024x1024", "1024x1536", "1536x1024"},
 		"quality":    {"low", "medium", "high", "xhigh", "max", "auto"},
-		"format":     {"png", "jpeg", "webp"},
+		"format":     {"png", "jpeg", "webp", "gif", "svg"},
 		"background": {"transparent", "opaque", "auto"},
 		"moderation": {"auto", "low"},
 	} {
 		_ = cmd.RegisterFlagCompletionFunc(flag, cobra.FixedCompletions(choices, cobra.ShellCompDirectiveNoFileComp))
 	}
-	return cmd
 }
 
 func newModelsCmd(o *options) *cobra.Command {
@@ -364,11 +399,12 @@ func newVersionCmd() *cobra.Command {
 }
 
 func addGenerateFlags(f *pflag.FlagSet, o *options) {
+	addImageParameterFlags(f, o)
 	f.StringVarP(&o.model, "model", "m", "", "图像模型名")
-	f.StringVar(&o.size, "size", "1024x1024", "尺寸：auto 或 WIDTHxHEIGHT")
-	f.StringVar(&o.quality, "quality", "medium", "质量：low/medium/high/xhigh/max/auto")
+	f.StringVar(&o.size, "size", "", "尺寸：auto 或 WIDTHxHEIGHT（默认省略，采用上游 auto）")
+	f.StringVar(&o.quality, "quality", "", "质量：low/medium/high/xhigh/max/auto（默认省略，采用上游 auto）")
 	f.StringVar(&o.background, "background", "", "背景：transparent/opaque/auto（默认不发送）")
-	f.StringVar(&o.outputFormat, "format", "png", "输出格式：png/jpeg/webp")
+	f.StringVar(&o.outputFormat, "format", "", "输出格式：png/jpeg/webp/gif/svg")
 	f.Var(&optionalIntValue{
 		target: &o.outputCompression,
 		set:    &o.outputCompressionSet,
@@ -376,7 +412,8 @@ func addGenerateFlags(f *pflag.FlagSet, o *options) {
 	f.StringVar(&o.moderation, "moderation", "", "审核：auto/low（默认不发送）")
 	f.IntVarP(&o.n, "count", "n", 1, "生成张数 1-10")
 	f.StringVarP(&o.out, "output-dir", "o", "", "输出目录（默认当前目录）")
-	f.BoolVar(&o.jsonOutput, "json", false, "以 JSON 输出结果")
+	f.BoolVar(&o.jsonOutput, "json", false, "以单个 JSON 对象输出结果和错误")
+	f.BoolVar(&o.jsonlOutput, "jsonl", false, "实时 JSONL 事件，要求 --stream=true，与 --json 互斥")
 }
 
 func maxArgs(n int) cobra.PositionalArgs {
@@ -463,6 +500,14 @@ type target struct {
 	key     string
 }
 
+// httpPayload 支持 JSON 和文件上的 multipart。每次请求使用独立的读取位置，
+// 429 重试可以完整重传，而不用把所有输入图片放进内存。
+type httpPayload struct {
+	reader      io.ReaderAt
+	size        int64
+	contentType string
+}
+
 func resolveTarget(o *options, cfg config) (target, error) {
 	baseURL := baseURLOf(o, cfg)
 	if baseURL == "" {
@@ -477,6 +522,14 @@ func resolveTarget(o *options, cfg config) (target, error) {
 
 // request 发出一次 HTTP 请求，统一处理鉴权头与超时。
 func (t target) request(path string, payload []byte, timeout time.Duration) (int, []byte, error) {
+	var body *httpPayload
+	if payload != nil {
+		body = &httpPayload{bytes.NewReader(payload), int64(len(payload)), "application/json"}
+	}
+	return t.requestPayload(path, body, timeout)
+}
+
+func (t target) requestPayload(path string, payload *httpPayload, timeout time.Duration) (int, []byte, error) {
 	authName, authValue := authHeader(t.key)
 	return httpCallWithRetry(endpoint(t.baseURL, path), authName, authValue, payload, timeout)
 }
@@ -537,11 +590,11 @@ func endpoint(base, path string) string {
 	return base + "/v1" + path
 }
 
-func httpCall(rawURL, authName, authValue string, payload []byte, timeout time.Duration) (int, []byte, error) {
+func httpCall(rawURL, authName, authValue string, payload *httpPayload, timeout time.Duration) (int, []byte, error) {
 	var body io.Reader
 	method := http.MethodGet
 	if payload != nil {
-		body = bytes.NewReader(payload)
+		body = io.NewSectionReader(payload.reader, 0, payload.size)
 		method = http.MethodPost
 	}
 	req, err := http.NewRequest(method, rawURL, body)
@@ -550,7 +603,12 @@ func httpCall(rawURL, authName, authValue string, payload []byte, timeout time.D
 	}
 	req.Header.Set(authName, authValue)
 	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", payload.contentType)
+		req.ContentLength = payload.size
+		// 307/308 重定向需要重新读取请求体；与每次 429 重试一样使用独立游标。
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(io.NewSectionReader(payload.reader, 0, payload.size)), nil
+		}
 	}
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
@@ -570,7 +628,7 @@ func httpCall(rawURL, authName, authValue string, payload []byte, timeout time.D
 
 // httpCallWithRetry 只对 429 重试。生成接口是非幂等的：一旦超时或 5xx，
 // 上游可能已经出图并计费，自动重试会重复扣费，所以那些情况直接报错。
-func httpCallWithRetry(rawURL, authName, authValue string, payload []byte, timeout time.Duration) (int, []byte, error) {
+func httpCallWithRetry(rawURL, authName, authValue string, payload *httpPayload, timeout time.Duration) (int, []byte, error) {
 	var status int
 	var data []byte
 	var err error
@@ -582,37 +640,6 @@ func httpCallWithRetry(rawURL, authName, authValue string, payload []byte, timeo
 		time.Sleep(retryDelay(attempt))
 	}
 	return status, data, err
-}
-
-func downloadURL(rawURL string, timeout time.Duration) ([]byte, error) {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		scheme := "无协议"
-		if parsed != nil && parsed.Scheme != "" {
-			scheme = parsed.Scheme
-		}
-		return nil, fmt.Errorf("上游返回了非法的图片 URL：%s", scheme)
-	}
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Get(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("下载图片 URL 失败：%w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("下载图片 URL 失败（HTTP %d）", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("读取图片内容失败：%w", err)
-	}
-	if len(data) == 0 {
-		return nil, errors.New("上游图片 URL 返回空内容")
-	}
-	if len(data) > maxResponseBytes {
-		return nil, fmt.Errorf("上游图片超过 %d 字节，已拒绝", maxResponseBytes)
-	}
-	return data, nil
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
@@ -669,10 +696,10 @@ func normalizeOutputFormat(format string) (string, error) {
 		return "jpeg", nil
 	case "jpg":
 		return "jpeg", nil
-	case "webp":
-		return "webp", nil
+	case "webp", "gif", "svg":
+		return strings.ToLower(strings.TrimSpace(format)), nil
 	default:
-		return "", errors.New("--format 必须是 png、jpeg、jpg 或 webp")
+		return "", errors.New("--format 必须是 png、jpeg、jpg、webp、gif 或 svg")
 	}
 }
 
@@ -690,21 +717,8 @@ func validateSize(size string) (string, error) {
 	if errW != nil || errH != nil {
 		return "", errors.New("--size 数值过大")
 	}
-	maxE, minE := w, h
-	if h > w {
-		maxE, minE = h, w
-	}
-	if maxE > maxEdge {
-		return "", errors.New("--size 最长边必须 ≤ 3840px")
-	}
-	if w%16 != 0 || h%16 != 0 {
-		return "", errors.New("--size 宽高必须是 16px 的整数倍")
-	}
-	if float64(maxE)/float64(minE) > maxRatio {
-		return "", errors.New("--size 长边/短边比例必须 ≤ 3:1")
-	}
-	if w*h > maxPixels {
-		return "", errors.New("--size 总像素不得超过 8,294,400（相当于 3840x2160）")
+	if w <= 0 || h <= 0 {
+		return "", errors.New("--size 宽高必须为正整数")
 	}
 	return size, nil
 }
@@ -712,7 +726,7 @@ func validateSize(size string) (string, error) {
 func validateQuality(quality string) (string, error) {
 	quality = strings.TrimSpace(quality)
 	switch quality {
-	case "low", "medium", "high", "xhigh", "max", "auto":
+	case "low", "medium", "high", "xhigh", "max", "auto", "standard", "hd":
 		return quality, nil
 	default:
 		return "", errors.New("--quality 必须是 low、medium、high、xhigh、max 或 auto")
@@ -751,100 +765,10 @@ func sniffImageExt(b []byte) string {
 	case len(b) >= 4 && string(b[:4]) == "GIF8":
 		return "gif"
 	}
+	if isSVG(b) {
+		return "svg"
+	}
 	return ""
-}
-
-func saveImages(items [][]byte, model, format, outDir string) ([]savedImage, error) {
-	absOutDir, err := filepath.Abs(outDir)
-	if err != nil {
-		return nil, fmt.Errorf("无法解析输出目录 %s：%w", outDir, err)
-	}
-	outDir = absOutDir
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return nil, fmt.Errorf("无法创建输出目录 %s：%w", outDir, err)
-	}
-	stem := fmt.Sprintf("%s-%s-%s", time.Now().Format("20060102-150405"), safeFileStem(model), randomHex(6))
-	images := make([]savedImage, 0, len(items))
-	mismatched := map[string]bool{}
-	unknown := 0
-	for i, raw := range items {
-		suffix := stem
-		if len(items) > 1 {
-			suffix += fmt.Sprintf("-%d", i)
-		}
-		// 扩展名必须跟实际字节一致：网关未必采纳 output_format。
-		ext := format
-		actual := sniffImageExt(raw)
-		switch {
-		case actual == "":
-			unknown++
-		case actual != format:
-			ext = actual
-			mismatched[actual] = true
-		}
-		p := filepath.Join(outDir, suffix+"."+ext)
-		if err := atomicWrite(p, raw, fileModeImage); err != nil {
-			return nil, fmt.Errorf("图片落盘失败：%w", err)
-		}
-		images = append(images, savedImage{Path: p, Format: ext, Bytes: len(raw)})
-	}
-	if len(mismatched) > 0 {
-		actuals := make([]string, 0, len(mismatched))
-		for actual := range mismatched {
-			actuals = append(actuals, actual)
-		}
-		sort.Strings(actuals)
-		warnf("网关返回的实际格式是 %s，与请求的 %s 不符；已按实际格式命名",
-			strings.Join(actuals, "/"), format)
-	}
-	if unknown > 0 {
-		warnf("有 %d 张图片的实际格式无法识别，已按请求的 %s 格式命名", unknown, format)
-	}
-	return images, nil
-}
-
-func parseItems(body []byte, timeout time.Duration) ([][]byte, error) {
-	var resp struct {
-		Data []struct {
-			B64JSON string `json:"b64_json"`
-			URL     string `json:"url"`
-		} `json:"data"`
-		Error json.RawMessage `json:"error"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, errors.New("上游响应不是合法 JSON")
-	}
-	if len(resp.Error) > 0 && string(resp.Error) != "null" {
-		return nil, fmt.Errorf("上游返回错误：%s", truncate(string(resp.Error), 1000))
-	}
-	if len(resp.Data) == 0 {
-		return nil, errors.New("上游响应里没有图像 data")
-	}
-	out := make([][]byte, 0, len(resp.Data))
-	for _, item := range resp.Data {
-		if item.B64JSON != "" {
-			raw, err := base64.StdEncoding.DecodeString(item.B64JSON)
-			if err != nil {
-				return nil, errors.New("上游返回了无效的 Base64 图像数据")
-			}
-			if len(raw) > 0 {
-				out = append(out, raw)
-				continue
-			}
-		}
-		if item.URL != "" {
-			raw, err := downloadURL(item.URL, timeout)
-			if err != nil {
-				// 下载是独立的网络往返，失败该归为可重试的网络错误，
-				// 而不是「上游返回错误」。
-				return nil, withExit(exitNetwork, err)
-			}
-			out = append(out, raw)
-			continue
-		}
-		return nil, errors.New("上游返回项里既没有 b64_json 也没有 url")
-	}
-	return out, nil
 }
 
 type modelsResult struct {
@@ -954,6 +878,9 @@ func filterModels(ids []string, keyword string) []string {
 }
 
 func readPrompt(o *options) error {
+	if o.promptArgument && o.prompt != "-" {
+		return nil
+	}
 	if p := strings.TrimSpace(o.prompt); p != "" && p != "-" {
 		return nil
 	}
@@ -976,12 +903,41 @@ func readPrompt(o *options) error {
 }
 
 func cmdGenerate(o *options, cfg config) error {
+	return cmdImage(o, cfg, false)
+}
+
+func cmdImage(o *options, cfg config, editing bool) error {
+	operationName := "generate"
+	if editing {
+		operationName = "edit"
+	}
+	o.result = newImageResult(operationName)
+	o.result.jsonl = o.jsonlOutput
+	if o.outputFormat != "" {
+		normalized, err := normalizeOutputFormat(o.outputFormat)
+		if err != nil {
+			return withExit(exitUsage, err)
+		}
+		o.outputFormat = normalized
+	}
+	o.quality = strings.TrimSpace(o.quality)
+	if err := validateImageParameters(o, editing); err != nil {
+		return withExit(exitUsage, err)
+	}
 	// 先校验参数再解析配置：参数写错时给出明确提示，别被「没配网关」盖掉。
-	size, err := validateSize(o.size)
+	if editing && (len(o.sources) == 0 || len(o.sources) > 16) {
+		return withExit(exitUsage, errors.New("edit 必须通过 --image、--image-url 或 --image-file-id 提供 1–16 张图片"))
+	}
+	sizeValue := first(o.size, cfg.Defaults.Size)
+	qualityValue := first(o.quality, cfg.Defaults.Quality)
+	size, err := validateSize(first(sizeValue, "auto"))
 	if err != nil {
 		return withExit(exitUsage, err)
 	}
-	quality, err := validateQuality(o.quality)
+	quality, err := validateQuality(first(qualityValue, "auto"))
+	if editing && (quality == "standard" || quality == "hd") {
+		return withExit(exitUsage, errors.New("edit 的 --quality 不支持 standard/hd"))
+	}
 	if err != nil {
 		return withExit(exitUsage, err)
 	}
@@ -993,7 +949,7 @@ func cmdGenerate(o *options, cfg config) error {
 	if err != nil {
 		return withExit(exitUsage, err)
 	}
-	format, err := normalizeOutputFormat(o.outputFormat)
+	format, err := normalizeOutputFormat(first(o.outputFormat, "png"))
 	if err != nil {
 		return withExit(exitUsage, err)
 	}
@@ -1013,7 +969,7 @@ func cmdGenerate(o *options, cfg config) error {
 				"--output-compression 只对 jpeg/webp 生效，当前 --format 是 %s", format))
 		}
 	}
-	timeout, err := timeoutOf(o)
+	_, err = timeoutOf(o)
 	if err != nil {
 		return withExit(exitUsage, err)
 	}
@@ -1021,6 +977,9 @@ func cmdGenerate(o *options, cfg config) error {
 		return withExit(exitUsage, err)
 	}
 	prompt := strings.TrimSpace(o.prompt)
+	if !utf8.ValidString(prompt) || utf8.RuneCountInString(prompt) > 32000 {
+		return withExit(exitUsage, errors.New("提示词必须是合法 UTF-8，且不超过 32000 个字符"))
+	}
 	if prompt == "" {
 		return withExit(exitUsage, errors.New("提示词不能为空；可以写参数，也可以用 stdin 管道传入"))
 	}
@@ -1029,54 +988,86 @@ func cmdGenerate(o *options, cfg config) error {
 	if baseURLOf(o, cfg) == "" {
 		return withExit(exitConfig, errors.New(configHint))
 	}
-	model, err := validateModel(first(o.model, os.Getenv("IMAGE_GEN_MODEL"), cfg.Model))
+	model := first(o.model, os.Getenv("IMAGE_GEN_MODEL"), cfg.Model)
+	if model != "" || !editing {
+		model, err = validateModel(model)
+	}
 	if err != nil {
 		return withExit(exitUsage, err)
 	}
+	if model != "" {
+		o.result.Model = &model
+	}
 	t, err := resolveTarget(o, cfg)
 	if err != nil {
-		return err
+		return imageError(exitConfig, "auth_resolution_failed", "config", err)
 	}
 
-	statusf(o, "正在生成图片（模型 %s）……", model)
-	body, err := json.Marshal(buildPayload(o, model, prompt, size, quality, format, background, moderation))
+	if sizeValue == "" {
+		size = ""
+	}
+	if qualityValue == "" {
+		quality = ""
+	}
+	if model != "" {
+		o.result.Model = &model
+	}
+	outDir, err := prepareOutputDir(first(o.out, os.Getenv("IMAGE_GEN_OUT_DIR"), cfg.OutDir))
 	if err != nil {
-		return err
+		return imageError(exitGeneral, "save_failed", "save", err)
 	}
-	status, response, err := t.request(generatePath, body, timeout)
-	if err != nil {
-		return withExit(exitNetwork, err)
-	}
-	if status >= 400 {
-		return withExit(exitUpstream, fmt.Errorf("生成失败（HTTP %d）：%s", status, truncate(string(response), 1500)))
-	}
-	items, err := parseItems(response, timeout)
-	if err != nil {
-		return withExit(exitUpstream, err)
-	}
-	outDir := first(o.out, os.Getenv("IMAGE_GEN_OUT_DIR"), cfg.OutDir)
-	if outDir == "" {
-		outDir = "."
-	}
-	images, err := saveImages(items, model, format, outDir)
-	if err != nil {
-		return err
-	}
-	if o.jsonOutput {
-		data, err := json.Marshal(struct {
-			Model  string       `json:"model"`
-			Images []savedImage `json:"images"`
-		}{Model: model, Images: images})
+	fields := buildPayload(o, model, prompt, size, quality, format, background, moderation)
+	operation, path := "生成", generatePath
+	var payload *httpPayload
+	if editing {
+		operation, path = "编辑", editPath
+		var cleanup func()
+		payload, cleanup, err = editPayload(o, fields)
 		if err != nil {
 			return err
 		}
-		fmt.Println(string(data))
-		return nil
+		defer cleanup()
+	} else {
+		body, err := json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+		payload = &httpPayload{bytes.NewReader(body), int64(len(body)), "application/json"}
 	}
-	for _, img := range images {
-		fmt.Println(img.Path)
+	statusf(o, "正在%s图片（模型 %s）……", operation, model)
+	if err := o.context().Err(); err != nil {
+		return imageNetworkError(err)
 	}
-	return nil
+	o.result.generationStatus = "unknown"
+	response, err := t.imageResponse(path, payload, o)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	o.result.httpStatus = &response.StatusCode
+	if id := response.Header.Get("X-Request-ID"); id != "" {
+		o.result.RequestID = &id
+	}
+	if response.StatusCode < 400 && strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		return o.result.consumeStream(response.Body, o, outDir)
+	}
+	body, err := readImageResponse(response.Body)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode >= 400 {
+		err := o.result.upstreamError(response.StatusCode, body)
+		if response.StatusCode == 429 && !quotaError(body) {
+			var failure *imageFailure
+			if errors.As(err, &failure) {
+				failure.Retry.Scope = "request"
+				failure.Retry.AfterSeconds = retryAfter(response.Header.Get("Retry-After"))
+			}
+		}
+		return err
+	}
+
+	return o.result.consumeJSON(body, o, outDir)
 }
 
 // modelEntry 是 /v1/models 单条的最小结构：OpenAI 只保证 id，
@@ -1115,24 +1106,7 @@ func pickImageModels(entries []modelEntry) ([]string, bool) {
 // buildPayload 按官方字段名组装请求体；可选字段只在显式设置时发送，
 // 免得老网关因为不认识的键直接 400。
 func buildPayload(o *options, model, prompt, size, quality, format, background, moderation string) map[string]any {
-	payload := map[string]any{
-		"model":         model,
-		"prompt":        prompt,
-		"n":             o.n,
-		"size":          size,
-		"quality":       quality,
-		"output_format": format,
-	}
-	if background != "" {
-		payload["background"] = background
-	}
-	if moderation != "" {
-		payload["moderation"] = moderation
-	}
-	if o.outputCompressionSet {
-		payload["output_compression"] = o.outputCompression
-	}
-	return payload
+	return requestFields(o, model, prompt, size, quality, format, background, moderation)
 }
 
 func cmdInit(o *options) error {
@@ -1446,4 +1420,16 @@ func uniqueSorted(values []string) []string {
 		}
 	}
 	return out
+}
+
+func captureImageFlags(cmd *cobra.Command, o *options) {
+	o.supplied = map[string]bool{}
+	cmd.Flags().Visit(func(f *pflag.Flag) { o.supplied[f.Name] = true })
+}
+
+func (o *options) context() context.Context {
+	if o.ctx != nil {
+		return o.ctx
+	}
+	return context.Background()
 }

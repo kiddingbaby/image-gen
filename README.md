@@ -5,7 +5,7 @@
 [![Go](https://img.shields.io/github/go-mod/go-version/kiddingbaby/image-gen)](go.mod)
 [![License](https://img.shields.io/github/license/kiddingbaby/image-gen)](LICENSE)
 
-把提示词发给 OpenAI 兼容的生图网关，图片落盘后把绝对路径打到 stdout。单文件静态二进制，无运行时依赖；网关地址、密钥、默认模型都由配置与环境变量决定，不写死。
+通过 OpenAI 兼容网关生成或编辑图片，支持 PNG/JPEG/WebP/GIF/SVG 输出、图片引用、标注层和流式预览。图片落盘后把绝对路径打到 stdout。单文件静态二进制，无运行时依赖；网关地址、密钥、默认模型都由配置与环境变量决定，不写死。
 
 参数表、退出码、失败信息怎么读这些用法细节在 [skills/image-gen](https://github.com/kiddingbaby/skills/blob/main/skills/image-gen/SKILL.md)——那是 agent 装的 skill 文档，本 README 只讲怎么装、怎么跑起来。
 
@@ -65,14 +65,18 @@ image-gen init --base-url https://你的网关/v1 \
 
 ```sh
 image-gen generate "一只在机房里打盹的橘猫" --size 1024x1024 --quality high
+image-gen edit "把背景换成雨夜街道" --image original.png
+image-gen edit "参考第二张图的风格修改选区" --image original.png --image reference.jpg --mask mask.png
 echo "提示词" | image-gen generate                      # 从 stdin 读，适合脚本
 image-gen models                                        # 列出网关可用图像模型
 image-gen generate "..." --model <模型> --count 2 --format webp --output-dir ./out
 ```
 
-默认 stdout 每行一个落盘绝对路径；加 `--json` 时 stdout 只有一个 JSON 对象，告警走 stderr。退出码区分「改命令」（2）、「补配置」（3）、「可重试的网络错误」（4）与「上游报错」（5），完整对照在 skill 文档里。
+默认 stdout 每行一个落盘绝对路径；加 `--json` 时 stdout 只有一个 JSON 对象，告警走 stderr。退出码区分「改命令」（2）、「补配置」（3）、「网络错误」（4）与「上游报错」（5），完整对照在 skill 文档里。
 
 ## 开发
+
+接口演进见 [官方能力对照](docs/api-coverage.md)和 [OpenAI Images API 兼容接口设计](docs/specs/openai-images-compatibility.md)。工作区已实现该契约；协议测试与真实服务验证分别记录。
 
 ```sh
 make check      # 完整门禁：格式 + vet + lint + 测试 + 构建
@@ -91,7 +95,7 @@ make help       # 列出全部目标
 ## 相关
 
 - [kiddingbaby/skills](https://github.com/kiddingbaby/skills) — 依赖本 CLI 的 `image-gen` skill：何时用、参数表、失败信息对照
-- 生成网关需兼容 OpenAI `/v1/images/generations`；只接了 chat 端点的模型在这里用不了
+- 生成需兼容 OpenAI `/v1/images/generations`，编辑需兼容 `/v1/images/edits` 的 multipart 或 JSON 请求；只接了 chat 端点的模型在这里用不了
 
 ## 许可与反馈
 

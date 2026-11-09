@@ -171,7 +171,7 @@ func TestGenerateSavesBase64Image(t *testing.T) {
 	if gotType != "application/json" {
 		t.Errorf("Content-Type = %q, 期望 application/json", gotType)
 	}
-	for _, k := range []string{"model", "prompt", "n", "size", "quality", "output_format"} {
+	for _, k := range []string{"model", "prompt"} {
 		if _, ok := gotBody[k]; !ok {
 			t.Errorf("请求体缺少字段 %q: %v", k, gotBody)
 		}

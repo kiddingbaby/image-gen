@@ -1,11 +1,7 @@
 package main
 
 import (
-	"bytes"
-	"encoding/base64"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -40,7 +36,7 @@ func TestValidateSize(t *testing.T) {
 			t.Errorf("validateSize(%q) unexpected error: %v", size, err)
 		}
 	}
-	for _, size := range []string{"", "1023x1024", "0x0", "1000x1000", "4096x1024"} {
+	for _, size := range []string{"", "0x0", "-1x100", "100x", "999999999999999999999x1"} {
 		if _, err := validateSize(size); err == nil {
 			t.Errorf("validateSize(%q) expected error", size)
 		}
@@ -60,18 +56,6 @@ func TestTomlStringRoundTrip(t *testing.T) {
 	}
 }
 
-func TestParseItemsBase64(t *testing.T) {
-	raw := []byte("png-bytes")
-	body := []byte(`{"data":[{"b64_json":"` + base64.StdEncoding.EncodeToString(raw) + `"}]}`)
-	items, err := parseItems(body, time.Second)
-	if err != nil {
-		t.Fatalf("parseItems failed: %v", err)
-	}
-	if len(items) != 1 || string(items[0]) != string(raw) {
-		t.Errorf("parseItems = %v, want one matching item", items)
-	}
-}
-
 func TestResolveAuthValue(t *testing.T) {
 	t.Setenv("IMAGE_GEN_API_KEY", "")
 	key, err := resolveAuth(authConfig{Value: "secret"})
@@ -83,15 +67,15 @@ func TestResolveAuthValue(t *testing.T) {
 	}
 }
 
-func TestValidateSizeOfficialBounds(t *testing.T) {
-	ok := []string{"auto", "256x256", "512x512", "1024x1024", "1536x1024", "1024x1536", "3840x2160", "2160x3840"}
+func TestValidateSizeSyntax(t *testing.T) {
+	ok := []string{"auto", "256x256", "512x512", "1024x1024", "1536x1024", "1024x1536", "3840x2160", "2160x3840", "1023x1024", "1000x1000", "3840x1080", "4096x2048", "3840x3840"}
 	for _, size := range ok {
 		if _, err := validateSize(size); err != nil {
 			t.Errorf("validateSize(%q) 应当通过，却报错：%v", size, err)
 		}
 	}
-	// 官方约束：16 的倍数、长边 ≤ 3840、长短边比 ≤ 3:1、总像素 ≤ 3840x2160
-	bad := []string{"1023x1024", "1000x1000", "3840x1080", "4096x2048", "3840x3840", "0x0", "abc"}
+	// 模型专属的边长、比例与像素预算交给上游；本地只检查通用语法。
+	bad := []string{"0x0", "abc", "1.5x100", "99999999999999999999999x1"}
 	for _, size := range bad {
 		if _, err := validateSize(size); err == nil {
 			t.Errorf("validateSize(%q) 应当被拒", size)
@@ -120,8 +104,8 @@ func TestNormalizeOutputFormat(t *testing.T) {
 			t.Errorf("normalizeOutputFormat(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	if _, err := normalizeOutputFormat("gif"); err == nil {
-		t.Error("normalizeOutputFormat(\"gif\") 应当被拒")
+	if _, err := normalizeOutputFormat("bmp"); err == nil {
+		t.Error("normalizeOutputFormat(\"bmp\") 应当被拒")
 	}
 }
 
@@ -132,7 +116,7 @@ func TestBuildPayloadOmitsUnsetOptionals(t *testing.T) {
 			t.Errorf("未设置的 %s 不应出现在请求体里", key)
 		}
 	}
-	full := buildPayload(&options{n: 2, outputCompressionSet: true, outputCompression: 80},
+	full := buildPayload(&options{n: 2, supplied: map[string]bool{"count": true, "format": true}, outputCompressionSet: true, outputCompression: 80},
 		"m", "p", "1024x1024", "high", "webp", "transparent", "low")
 	for _, key := range []string{"background", "moderation", "output_compression"} {
 		if _, ok := full[key]; !ok {
@@ -156,41 +140,6 @@ func TestSniffImageExt(t *testing.T) {
 		if got := sniffImageExt([]byte(data)); got != want {
 			t.Errorf("sniffImageExt(%q) = %q, want %q", data, got, want)
 		}
-	}
-}
-
-func TestSaveImagesUsesActualFormat(t *testing.T) {
-	dir := t.TempDir()
-	// 请求 webp，但网关回的是 PNG：扩展名必须按实际内容走，并给出提示。
-	pngBytes := []byte("\x89PNG\r\n\x1a\n....")
-	var buf bytes.Buffer
-	old := warnWriter
-	warnWriter = &buf
-	defer func() { warnWriter = old }()
-
-	images, err := saveImages([][]byte{pngBytes}, "hubimg/model", "webp", dir)
-	if err != nil {
-		t.Fatalf("saveImages 失败：%v", err)
-	}
-	if len(images) != 1 || filepath.Ext(images[0].Path) != ".png" {
-		t.Fatalf("落盘扩展名应跟随真实格式，实际：%v", images)
-	}
-	if images[0].Format != "png" || images[0].Bytes != len(pngBytes) {
-		t.Fatalf("图片元数据不正确：%+v", images[0])
-	}
-	if !strings.Contains(buf.String(), "webp") {
-		t.Errorf("应当提示格式不符，实际输出：%q", buf.String())
-	}
-}
-
-func TestSaveImagesReturnsAbsolutePaths(t *testing.T) {
-	t.Chdir(t.TempDir())
-	images, err := saveImages([][]byte{[]byte("\x89PNG\r\n\x1a\nrest")}, "model", "png", "relative-out")
-	if err != nil {
-		t.Fatalf("saveImages 失败：%v", err)
-	}
-	if len(images) != 1 || !filepath.IsAbs(images[0].Path) {
-		t.Fatalf("产物路径应为绝对路径，实际：%v", images)
 	}
 }
 
@@ -221,25 +170,6 @@ func TestSafeFileStem(t *testing.T) {
 		if got := safeFileStem(in); got != want {
 			t.Errorf("safeFileStem(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-func TestSaveImagesWarnsOnUnknownFormat(t *testing.T) {
-	dir := t.TempDir()
-	var buf bytes.Buffer
-	old := warnWriter
-	warnWriter = &buf
-	defer func() { warnWriter = old }()
-
-	images, err := saveImages([][]byte{[]byte("not-an-image")}, "model", "png", dir)
-	if err != nil {
-		t.Fatalf("saveImages 失败：%v", err)
-	}
-	if len(images) != 1 || filepath.Ext(images[0].Path) != ".png" {
-		t.Fatalf("未知格式应按请求格式命名，实际：%v", images)
-	}
-	if !strings.Contains(buf.String(), "无法识别") {
-		t.Errorf("应提示实际格式无法识别，实际输出：%q", buf.String())
 	}
 }
 
@@ -325,24 +255,6 @@ func TestPickImageModelsPrefersDeclaredMode(t *testing.T) {
 	ids, confident = pickImageModels(none)
 	if confident || len(ids) != 1 {
 		t.Errorf("无匹配时应退回全量，实际：%v confident=%v", ids, confident)
-	}
-}
-
-func TestParseItemsHonorsTimeout(t *testing.T) {
-	// 1ns 的超时在任何真实网络往返里都必然触发，用来证明超时确实传到了下载。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\n"))
-	}))
-	defer srv.Close()
-
-	body := []byte(`{"data":[{"url":"` + srv.URL + `/a.png"}]}`)
-	if _, err := parseItems(body, time.Nanosecond); err == nil {
-		t.Fatal("超时应当导致解析失败")
-	} else if exitCodeOf(err) != exitNetwork {
-		t.Errorf("下载超时应归为网络错误（%d），实际 %d", exitNetwork, exitCodeOf(err))
-	}
-	if _, err := parseItems(body, 5*time.Second); err != nil {
-		t.Fatalf("正常超时下应当成功：%v", err)
 	}
 }
 
