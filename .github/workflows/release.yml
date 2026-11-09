@@ -1,0 +1,63 @@
+name: Release
+
+# 一条版本轴：vX.Y.Z 对应根 VERSION，也对应 image-gen 二进制的版本。
+# 每次发布都带二进制资产，/releases/latest/ 与 go install ...@latest 指向同一个版本。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # 固定版本，不用 go-version-file：显式钉住，保证发布产物用同一个工具链。
+          go-version: "1.26"
+          cache: true
+
+      - name: Build release assets
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"          # v1.2.3
+          version="${tag#v}"
+          file_version="$(tr -d ' \t\r\n' < VERSION)"
+          if [ "$version" != "$file_version" ]; then
+            echo "tag version ($version) 与根 VERSION ($file_version) 不一致" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          assets=""
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            ext=""
+            if [ "$goos" = windows ]; then ext=".exe"; fi
+            name="image-gen-${goos}-${goarch}${ext}"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=${version}" \
+              -o "dist/${name}" .
+            assets="$assets $name"
+          done
+          (cd dist && sha256sum $assets > image-gen-checksums.txt)
+          cat dist/image-gen-checksums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "image-gen v${version}" \
+              --generate-notes
+          fi

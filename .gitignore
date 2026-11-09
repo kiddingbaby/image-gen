@@ -1,0 +1,9 @@
+.DS_Store
+*.log
+
+# Go 构建产物
+/dist/
+/image-gen
+/image-gen.exe
+# 本地 Go 构建缓存（GOCACHE 指向这里，避免写 ~/.cache）
+/.cache/

@@ -1,0 +1,45 @@
+name: Go
+
+# 矩阵很贵：Windows 按 2 倍、macOS 按 10 倍扣免费额度，私有仓库每月只有 2000 分钟。
+# 所以它只在 Go 代码变动时跑；日常由 Gitea 的 validate 守着。
+on:
+  pull_request:
+    paths:
+      - '*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'scripts/**'
+      - '.github/workflows/go.yml'
+
+  schedule:
+    # 路径过滤对定时触发不生效；上游镜像与 Go 版本漂移只有定时跑才看得到
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  go:
+    # 三平台只在 GitHub 上跑；Gitea 侧由 .gitea/workflows/validate.yml 覆盖
+    if: github.server_url == 'https://github.com'
+    strategy:
+      fail-fast: false
+      # macOS 只在手动触发（发版前）时加入：它哪怕只跑 12 秒也按 1 分钟 × 10 倍
+      # 计费。平台差异（UserConfigDir、0600 权限位）在发版前手动跑一次即可。
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest","windows-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # 固定版本，不用 go-version-file：显式钉住，保证三平台跑同一个工具链。
+          go-version: "1.26"
+          cache: true
+
+      # 不调用 scripts/check.sh：Windows 上是 pwsh，走不通那套 bash。
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./...
+          go build -o "${{ runner.temp }}/image-gen" .
