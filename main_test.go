@@ -336,7 +336,7 @@ func TestPickImageModelsPrefersDeclaredMode(t *testing.T) {
 func TestParseItemsHonorsTimeout(t *testing.T) {
 	// 1ns 的超时在任何真实网络往返里都必然触发，用来证明超时确实传到了下载。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("\x89PNG\r\n\x1a\n"))
+		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\n"))
 	}))
 	defer srv.Close()
 

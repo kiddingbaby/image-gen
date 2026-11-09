@@ -1135,7 +1135,7 @@ func TestStdinIsTerminalRejectsDevNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("打开 %s 失败: %v", os.DevNull, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	old := os.Stdin
 	os.Stdin = f
 	t.Cleanup(func() { os.Stdin = old })

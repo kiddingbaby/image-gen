@@ -150,7 +150,8 @@ type savedImage struct {
 var warnWriter io.Writer = os.Stderr
 
 func warnf(format string, args ...any) {
-	fmt.Fprintf(warnWriter, "image-gen: "+format+"\n", args...)
+	// 告警写不出去不该中断生成流程，显式忽略写入错误。
+	_, _ = fmt.Fprintf(warnWriter, "image-gen: "+format+"\n", args...)
 }
 
 // 退出码让 agent 能区分该改参数、该补配置，还是该重试。
@@ -500,7 +501,7 @@ func resolveAuth(a authConfig) (string, error) {
 		if err != nil {
 			detail := strings.TrimSpace(stderr.String())
 			if detail != "" {
-				return "", fmt.Errorf("执行密钥命令失败：%v（%s）", err, detail)
+				return "", fmt.Errorf("执行密钥命令失败：%w（%s）", err, detail)
 			}
 			return "", fmt.Errorf("执行密钥命令失败：%w", err)
 		}
@@ -556,7 +557,7 @@ func httpCall(rawURL, authName, authValue string, payload []byte, timeout time.D
 	if err != nil {
 		return 0, nil, fmt.Errorf("网络错误：%w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return resp.StatusCode, nil, fmt.Errorf("读取响应失败：%w", err)
@@ -597,7 +598,7 @@ func downloadURL(rawURL string, timeout time.Duration) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("下载图片 URL 失败：%w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("下载图片 URL 失败（HTTP %d）", resp.StatusCode)
 	}
@@ -1338,7 +1339,7 @@ func statusf(o *options, format string, args ...any) {
 	if o.quiet || !stderrTTY() {
 		return
 	}
-	fmt.Fprintf(statusWriter, "image-gen: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(statusWriter, "image-gen: "+format+"\n", args...)
 }
 
 func ask(prompt, defaultValue string) (string, error) {
