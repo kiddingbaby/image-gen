@@ -134,7 +134,11 @@ func (r *imageResult) upstreamError(status int, body []byte) error {
 	if status >= 400 && status < 500 {
 		r.generationStatus = "not_started"
 	}
-	failure := &imageFailure{Code: "upstream_error", Message: fmt.Sprintf("上游返回错误（HTTP %d）：%s", status, truncate(string(body), 1500)), Stage: "request", HTTPStatus: &status, Upstream: raw, Retry: retryInfo{Scope: "none"}}
+	summary := body
+	if r.Response != nil {
+		summary, _ = json.Marshal(r.Response)
+	}
+	failure := &imageFailure{Code: "upstream_error", Message: fmt.Sprintf("上游返回错误（HTTP %d）：%s", status, truncate(string(summary), 1500)), Stage: "request", HTTPStatus: &status, Upstream: raw, Retry: retryInfo{Scope: "none"}}
 	return withExit(exitUpstream, failure)
 }
 func prepareOutputDir(path string) (string, error) {
@@ -187,6 +191,7 @@ func (r *imageResult) consumeJSON(body []byte, o *options, dir string) error {
 	if err := json.Unmarshal(body, &r.Response); err != nil || r.Response == nil {
 		return imageError(exitUpstream, "invalid_response", "decode", errors.New("上游响应不是合法 JSON 对象"))
 	}
+	encoded := stripResponseImages(r.Response)
 	if raw := r.Response["error"]; len(raw) > 0 && string(raw) != "null" {
 		return r.upstreamError(200, body)
 	}
@@ -194,13 +199,7 @@ func (r *imageResult) consumeJSON(body []byte, o *options, dir string) error {
 	if err := json.Unmarshal(r.Response["data"], &data); err != nil {
 		return imageError(exitUpstream, "invalid_response", "decode", errors.New("上游响应里没有有效图像 data"))
 	}
-	// 先保留完整元数据并剥离所有 base64，后续失败时仍能恢复 URL。
-	encoded := make([]json.RawMessage, len(data))
-	for i, item := range data {
-		encoded[i] = item["b64_json"]
-		delete(item, "b64_json")
-	}
-	r.Response["data"], _ = json.Marshal(data)
+
 	if o.stream {
 		r.warning("stream_ignored", "请求流式响应，但网关返回完整 JSON；已接收结果")
 		if r.outputErr != nil {
@@ -261,12 +260,26 @@ func readImageResponse(reader io.Reader) ([]byte, error) {
 	return data, nil
 }
 
-func stripResponseImages(response map[string]json.RawMessage) {
-	var data []map[string]json.RawMessage
-	if raw, ok := response["data"]; ok && json.Unmarshal(raw, &data) == nil && string(raw) != "null" {
-		for _, item := range data {
-			delete(item, "b64_json")
-		}
-		response["data"], _ = json.Marshal(data)
+// 逐项去除图像数据；一个错误项不能让其它项的 base64 留在结果中。
+func stripResponseImages(response map[string]json.RawMessage) []json.RawMessage {
+	raw, ok := response["data"]
+	if !ok || string(raw) == "null" {
+		return nil
 	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil
+	}
+	encoded := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(item, &object); err != nil || object == nil {
+			continue
+		}
+		encoded[i] = object["b64_json"]
+		delete(object, "b64_json")
+		items[i], _ = json.Marshal(object)
+	}
+	response["data"], _ = json.Marshal(items)
+	return encoded
 }

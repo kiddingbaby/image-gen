@@ -846,3 +846,52 @@ func TestRequestHeaderSurvivesErrorBodyTimeout(t *testing.T) {
 		t.Fatalf("err=%v result=%s", err, stdout)
 	}
 }
+
+func TestRejectsIncompleteGIFSignature(t *testing.T) {
+	resetEnv(t)
+	srv := newGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"data": []any{map[string]any{"b64_json": base64.StdEncoding.EncodeToString([]byte("GIF8upstream error: generation failed"))}}})
+	}, nil)
+	outDir := t.TempDir()
+	stdout, err := runCLI(t, append(generateArgs(t), "--base-url", srv.URL, "--model", "m", "--output-dir", outDir, "--format", "gif", "--json", "猫")...)
+	if err == nil || exitCodeOf(err) != 5 || !strings.Contains(stdout, `"code":"invalid_image"`) {
+		t.Fatalf("err=%v result=%s", err, stdout)
+	}
+	if files := listFiles(t, outDir); len(files) != 0 {
+		t.Fatalf("invalid output files: %v", files)
+	}
+}
+
+func TestMalformedRowsDoNotLeakImageData(t *testing.T) {
+	resetEnv(t)
+	for _, status := range []int{200, 400} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			srv := newGateway(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				writeJSON(w, map[string]any{"data": []any{map[string]any{"b64_json": samplePNGB64, "url": "https://example.test/result.png", "extra": 7}, "invalid row"}, "vendor": true})
+			}, nil)
+			stdout, err := runCLI(t, append(generateArgs(t), "--base-url", srv.URL, "--model", "m", "--output-dir", t.TempDir(), "--json", "猫")...)
+			if err == nil || exitCodeOf(err) != 5 {
+				t.Fatalf("err=%v", err)
+			}
+			var result struct {
+				Response map[string]json.RawMessage `json:"response"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(result.Response["data"], []byte("b64_json")) || bytes.Contains(result.Response["data"], []byte(samplePNGB64)) {
+				t.Fatalf("Base64 leaked in response=%s", result.Response["data"])
+			}
+			var items []json.RawMessage
+			if err := json.Unmarshal(result.Response["data"], &items); err != nil {
+				t.Fatal(err)
+			}
+			var first map[string]any
+			_ = json.Unmarshal(items[0], &first)
+			if first["url"] != "https://example.test/result.png" || first["extra"] != float64(7) || string(items[1]) != `"invalid row"` || string(result.Response["vendor"]) != "true" {
+				t.Fatalf("metadata changed: %s", stdout)
+			}
+		})
+	}
+}

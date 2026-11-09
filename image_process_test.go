@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -123,6 +124,182 @@ func TestCancelStreamingSubprocess(t *testing.T) {
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), "image-gen-upload-") {
 			t.Fatalf("upload leaked: %s", entry.Name())
+		}
+	}
+}
+
+// 在真实 stdin 边界发出就绪标记，避免用固定延迟猜测信号处理器是否已安装。
+type promptReadyReader struct{ marker string }
+
+func (r promptReadyReader) Read(p []byte) (int, error) {
+	if err := os.WriteFile(r.marker, []byte("ready"), 0600); err != nil {
+		return 0, err
+	}
+	return os.Stdin.Read(p)
+}
+func TestPromptCancellationHelper(t *testing.T) {
+	marker := os.Getenv("IMAGE_GEN_TEST_PROMPT_READY")
+	if marker == "" {
+		return
+	}
+	stdinReader = promptReadyReader{marker: marker}
+	if err := run([]string{"generate", "--json", "--config", filepath.Join(filepath.Dir(marker), "missing"), "-"}); err != nil {
+		os.Exit(exitCodeOf(err))
+	}
+	os.Exit(0)
+}
+
+func TestCancelWhileReadingPrompt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows os.Process.Signal 不支持 Interrupt")
+	}
+	resetEnv(t)
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "ready")
+	command := exec.Command(binary, "-test.run=^TestPromptCancellationHelper$")
+	command.Env = append(os.Environ(), "IMAGE_GEN_TEST_PROMPT_READY="+marker)
+	input, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	completed := false
+	finished := make(chan error, 1)
+	go func() { finished <- command.Wait() }()
+	t.Cleanup(func() {
+		if !completed {
+			_ = command.Process.Kill()
+			<-finished
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stdin 读取未开始")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-time.After(3 * time.Second):
+		t.Fatal("Ctrl-C 未取消等待 stdin 的命令")
+	case err := <-finished:
+		completed = true
+		if err == nil || command.ProcessState.ExitCode() != 130 {
+			t.Fatalf("exit=%v stderr=%s", err, stderr.String())
+		}
+		var result struct {
+			Status string `json:"status"`
+			Error  struct {
+				Code             string `json:"code"`
+				GenerationStatus string `json:"generation_status"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("JSON: %v output=%s", err, stdout.String())
+		}
+		if result.Status != "failed" || result.Error.Code != "canceled" || result.Error.GenerationStatus != "not_started" {
+			t.Fatalf("result=%s", stdout.String())
+		}
+	}
+}
+
+func TestAuthCancellationHelper(t *testing.T) {
+	marker := os.Getenv("IMAGE_GEN_TEST_AUTH_READY")
+	if marker == "" {
+		return
+	}
+	if err := os.WriteFile(marker, []byte("ready"), 0600); err != nil {
+		os.Exit(1)
+	}
+	time.Sleep(10 * time.Second)
+	os.Exit(0)
+}
+
+func TestCancelWhileResolvingAuth(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows os.Process.Signal 不支持 Interrupt")
+	}
+	resetEnv(t)
+	t.Setenv("IMAGE_GEN_API_KEY", "")
+	binary := filepath.Join(t.TempDir(), "image-gen")
+	if out, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v %s", err, out)
+	}
+	helper, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	config := fmt.Sprintf("base_url = 'https://example.invalid'\nmodel = 'm'\n[auth]\ncommand = %s\nargs = ['-test.run=^TestAuthCancellationHelper$']\n", strconv.Quote(helper))
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "ready")
+	command := exec.Command(binary, "generate", "--json", "--config", configPath, "猫")
+	command.Env = append(os.Environ(), "IMAGE_GEN_TEST_AUTH_READY="+marker)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	completed := false
+	finished := make(chan error, 1)
+	go func() { finished <- command.Wait() }()
+	t.Cleanup(func() {
+		if !completed {
+			_ = command.Process.Kill()
+			<-finished
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("取密钥命令未启动")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ctrl-C 未取消取密钥命令")
+	case err := <-finished:
+		completed = true
+		if err == nil || command.ProcessState.ExitCode() != 130 {
+			t.Fatalf("exit=%v stderr=%s", err, stderr.String())
+		}
+		var result struct {
+			Error struct {
+				Code             string `json:"code"`
+				Stage            string `json:"stage"`
+				GenerationStatus string `json:"generation_status"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Error.Code != "canceled" || result.Error.Stage != "config" || result.Error.GenerationStatus != "not_started" {
+			t.Fatalf("result=%s", stdout.String())
 		}
 	}
 }

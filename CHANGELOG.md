@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-09
+
 ### Added
 
 - 完整映射 Images API 生成/编辑参数：SVG/GIF、complexity、帧控制、input_fidelity、safety_identifier、嵌套 svg 选项，以及旧模型的 response_format/style/user。
@@ -19,16 +21,16 @@
 - **0.12.0 兼容性变更**：未指定的可选字段不再发送，size/quality 使用上游默认 auto。要保持历史效果，显式设置 `--size 1024x1024 --quality medium`，或写入 `[defaults]` 的 size/quality。编辑允许省略 model，JSON model 此时为 null。
 - prompt 统一限制为合法 UTF-8、1–32,000 个 Unicode 码点；本地上传严格小于 50,000,000 字节；尺寸仅检查正整数语法，模型专属限制交给上游。
 - 未知图片内容改为失败；结果数量不符返回 incomplete_result。JSON 增加 schema_version=1 及错误契约，原 model/images 字段保留。
-
 - 仓库工程化补齐：CI 拆成 lint（golangci-lint）/ test（ubuntu + windows，发版前手动加 macOS）/ govulncheck 三个 job；新增 `.golangci.yml`、dependabot、issue 与 PR 模板、`CONTRIBUTING.md`、`SECURITY.md`、`CODE_OF_CONDUCT.md`。
 - 本地入口收敛到 `make`（`check` / `fmt` / `fmt-check` / `vet` / `lint` / `test` / `cover` / `build` / `clean`），删掉仓库自用的 `scripts/check.sh`；发布工作流的 tag 与 `VERSION` 核对逻辑不变。
 - 仓库已公开，只在 GitHub 维护：删掉 Gitea 侧的 `validate.yml` 与 Gitea 镜像地址，安装与发布地址只剩 GitHub。
 
 ### Fixed
 
+- Ctrl-C 在等待 stdin 或外部取密钥时也会退出并返回结构化取消错误；其它命令保留原有中断行为。GIF 识别检查完整签名；混合错误响应项不会让其它图片的 Base64 泄漏到 JSON 元数据。
+
 - 额度类 429 不再自动重试；限流尊重 Retry-After，超时、5xx 和流中断不重复 POST。图片 URL 临时下载错误仅重试同一 URL，不重复生成。
 - 请求 1 张但网关返回多张时不再覆盖产物；错误响应和读取错误体超时仍保留 request ID 等可用元数据。
-
 - 补齐 6 处未检查的错误返回值（`resp.Body.Close`、`fmt.Fprintf`、测试里的 `w.Write` / `f.Close`）与 1 处未用 `%w` 包装的错误。仅错误处理方式变化，CLI 行为不变。
 
 ## [0.11.3] - 2026-11-09

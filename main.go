@@ -224,10 +224,15 @@ func main() {
 
 // run 用 Cobra 执行命令树；单独抽出来便于测试。
 func run(args []string) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	o := &options{ctx: ctx}
+	o := &options{ctx: context.Background()}
+	stop := func() {}
+	defer func() { stop() }()
 	root := rootCommand(o)
+	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
+		if cmd.Name() == "generate" || cmd.Name() == "edit" {
+			o.ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt)
+		}
+	}
 	root.SetArgs(args)
 	cmd, err := root.ExecuteC()
 	if cmd != nil && (cmd.Name() == "generate" || cmd.Name() == "edit") && (err != nil || o.result != nil) {
@@ -513,7 +518,7 @@ func resolveTarget(o *options, cfg config) (target, error) {
 	if baseURL == "" {
 		return target{}, withExit(exitConfig, errors.New(configHint))
 	}
-	key, err := resolveAuth(cfg.Auth)
+	key, err := resolveAuthContext(o.context(), cfg.Auth)
 	if err != nil {
 		return target{}, withExit(exitConfig, err)
 	}
@@ -543,14 +548,22 @@ func baseURLOf(o *options, cfg config) string {
 }
 
 func resolveAuth(a authConfig) (string, error) {
+	return resolveAuthContext(context.Background(), a)
+}
+
+func resolveAuthContext(ctx context.Context, a authConfig) (string, error) {
 	if k := strings.TrimSpace(os.Getenv("IMAGE_GEN_API_KEY")); k != "" {
 		return k, nil
 	}
 	if a.Command != "" {
 		var stderr bytes.Buffer
-		cmd := exec.Command(a.Command, a.Args...)
+		cmd := exec.CommandContext(ctx, a.Command, a.Args...)
+		cmd.WaitDelay = 100 * time.Millisecond
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
+		if ctx.Err() != nil {
+			return "", imageError(130, "canceled", "config", errors.New("取密钥已取消"))
+		}
 		if err != nil {
 			detail := strings.TrimSpace(stderr.String())
 			if detail != "" {
@@ -762,7 +775,7 @@ func sniffImageExt(b []byte) string {
 		return "jpeg"
 	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP":
 		return "webp"
-	case len(b) >= 4 && string(b[:4]) == "GIF8":
+	case len(b) >= 6 && (string(b[:6]) == "GIF87a" || string(b[:6]) == "GIF89a"):
 		return "gif"
 	}
 	if isSVG(b) {
@@ -887,7 +900,23 @@ func readPrompt(o *options) error {
 	if o.prompt != "-" && stdinTTY() {
 		return nil
 	}
-	data, err := io.ReadAll(io.LimitReader(stdinReader, promptMaxBytes+1))
+	type promptRead struct {
+		data []byte
+		err  error
+	}
+	done := make(chan promptRead, 1)
+	go func() {
+		data, err := io.ReadAll(io.LimitReader(stdinReader, promptMaxBytes+1))
+		done <- promptRead{data, err}
+	}()
+	var data []byte
+	var err error
+	select {
+	case <-o.context().Done():
+		return imageError(130, "canceled", "validate", errors.New("读取提示词已取消"))
+	case result := <-done:
+		data, err = result.data, result.err
+	}
 	if err != nil {
 		return fmt.Errorf("读取标准输入失败：%w", err)
 	}
@@ -1000,6 +1029,9 @@ func cmdImage(o *options, cfg config, editing bool) error {
 	}
 	t, err := resolveTarget(o, cfg)
 	if err != nil {
+		if o.context().Err() != nil {
+			return err
+		}
 		return imageError(exitConfig, "auth_resolution_failed", "config", err)
 	}
 
